@@ -1,0 +1,70 @@
+name: Java CI and Tomcat deployment
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build, test, and publish WAR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Java 17 and cache Maven dependencies
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+          cache: maven
+
+      - name: Validate, test, and package
+        run: mvn --batch-mode --no-transfer-progress clean verify
+
+      - name: Verify deployment WAR
+        run: test -s target/image.war
+
+      - name: Upload deployment WAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: tomcat-deployment-war
+          path: target/image.war
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Trigger Jenkins deployment
+        if: success()
+        env:
+          JENKINS_URL: ${{ secrets.JENKINS_URL }}
+          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_TOKEN: ${{ secrets.JENKINS_TOKEN }}
+        run: |
+          set -eu
+          : "${JENKINS_URL:?Configure the JENKINS_URL repository secret}"
+          : "${JENKINS_USER:?Configure the JENKINS_USER repository secret}"
+          : "${JENKINS_TOKEN:?Configure the JENKINS_TOKEN repository secret}"
+
+          jenkins_url="${JENKINS_URL%/}"
+          curl_config="$(mktemp)"
+          trap 'rm -f "$curl_config"' EXIT
+          chmod 600 "$curl_config"
+          printf 'user = "%s:%s"\n' "$JENKINS_USER" "$JENKINS_TOKEN" > "$curl_config"
+
+          crumb_json="$(curl --config "$curl_config" --fail --silent --show-error \
+            "${jenkins_url}/crumbIssuer/api/json")"
+          crumb_field="$(printf '%s' "$crumb_json" | jq -er '.crumbRequestField')"
+          crumb="$(printf '%s' "$crumb_json" | jq -er '.crumb')"
+
+          curl --config "$curl_config" --fail --silent --show-error \
+            --request POST \
+            --header "${crumb_field}: ${crumb}" \
+            --data-urlencode "GITHUB_REPOSITORY=${GITHUB_REPOSITORY}" \
+            --data-urlencode "GITHUB_RUN_ID=${GITHUB_RUN_ID}" \
+            --data-urlencode "ARTIFACT_NAME=tomcat-deployment-war" \
+            "${jenkins_url}/job/TomcatDeployment/buildWithParameters"

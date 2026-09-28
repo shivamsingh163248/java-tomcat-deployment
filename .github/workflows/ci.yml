@@ -41,14 +41,20 @@ jobs:
       - name: Trigger Jenkins deployment
         if: success()
         env:
-          JENKINS_URL: ${{ secrets.JENKINS_URL }}
-          JENKINS_USER: ${{ secrets.JENKINS_USER }}
+          JENKINS_URL: http://20.219.118.177:8080
+          JENKINS_USER: shsingh
           JENKINS_TOKEN: ${{ secrets.JENKINS_TOKEN }}
         run: |
           set -eu
-          : "${JENKINS_URL:?Configure the JENKINS_URL repository secret}"
-          : "${JENKINS_USER:?Configure the JENKINS_USER repository secret}"
           : "${JENKINS_TOKEN:?Configure the JENKINS_TOKEN repository secret}"
+
+          case "$JENKINS_URL" in
+            https://*) ;;
+            *)
+              echo "::error::Jenkins must use HTTPS before GitHub Actions can send its API token. Enable TLS for Jenkins and update JENKINS_URL."
+              exit 1
+              ;;
+          esac
 
           jenkins_url="${JENKINS_URL%/}"
           curl_config="$(mktemp)"

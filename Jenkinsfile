@@ -1,8 +1,12 @@
 pipeline {
-    agent any
+    agent {
+        label 'tomcat-local'
+    }
 
     options {
         timestamps()
+        disableConcurrentBuilds()
+        skipDefaultCheckout(true)
     }
 
     parameters {
@@ -24,20 +28,9 @@ pipeline {
                     if (params.ARTIFACT_NAME != 'tomcat-deployment-war') {
                         error('ARTIFACT_NAME must be tomcat-deployment-war.')
                     }
-                    if (!env.TOMCAT_HOST || !(env.TOMCAT_HOST ==~ /[A-Za-z0-9.-]+/)) {
-                        error('Configure TOMCAT_HOST as a DNS name or IPv4 address in Jenkins.')
-                    }
-                    if (!env.TOMCAT_SSH_PORT || !(env.TOMCAT_SSH_PORT ==~ /[0-9]+/) ||
-                            env.TOMCAT_SSH_PORT.toInteger() < 1 || env.TOMCAT_SSH_PORT.toInteger() > 65535) {
-                        error('Configure TOMCAT_SSH_PORT as a valid SSH port in Jenkins.')
-                    }
                     if (!env.CATALINA_HOME || !(env.CATALINA_HOME ==~ /\/[A-Za-z0-9_./-]+/) ||
                             env.CATALINA_HOME.split('/').contains('..')) {
-                        error('Configure CATALINA_HOME as an absolute Tomcat path without parent-directory segments.')
-                    }
-                    if (!env.TOMCAT_REMOTE_TMP || !(env.TOMCAT_REMOTE_TMP ==~ /\/[A-Za-z0-9_./-]+/) ||
-                            env.TOMCAT_REMOTE_TMP.split('/').contains('..')) {
-                        error('Configure TOMCAT_REMOTE_TMP as an absolute temporary directory without parent-directory segments.')
+                        error('Configure CATALINA_HOME as an absolute Tomcat path on this Jenkins host without parent-directory segments.')
                     }
                     if (!env.TOMCAT_HEALTH_URL ||
                             !(env.TOMCAT_HEALTH_URL ==~ /https?:\/\/[A-Za-z0-9.-]+(:[0-9]+)?\/image\/?/)) {
@@ -91,28 +84,46 @@ pipeline {
 
         stage('Deploy WAR to Tomcat') {
             steps {
-                withCredentials([sshUserPrivateKey(
-                    credentialsId: 'tomcat-deploy-ssh',
-                    keyFileVariable: 'TOMCAT_SSH_KEY',
-                    usernameVariable: 'TOMCAT_USER'
-                )]) {
-                    sh '''
-                        set +x
-                        set -eu
-                        remote_dir="${TOMCAT_REMOTE_TMP%/}/tomcat-deploy-${BUILD_NUMBER}"
-                        target="${TOMCAT_USER}@${TOMCAT_HOST}"
+                sh '''
+                    set +x
+                    set -eu
+                    war_file="$WORKSPACE/image.war"
+                    webapps_dir="${CATALINA_HOME%/}/webapps"
+                    temporary_war="$webapps_dir/.image.war.new-${BUILD_NUMBER}"
 
-                        ssh -i "$TOMCAT_SSH_KEY" -o BatchMode=yes -p "$TOMCAT_SSH_PORT" "$target" \
-                            "mkdir -p -- $remote_dir"
-                        scp -i "$TOMCAT_SSH_KEY" -o BatchMode=yes -P "$TOMCAT_SSH_PORT" \
-                            "$WORKSPACE/image.war" "$WORKSPACE/scripts/deploy-tomcat.sh" \
-                            "$target:$remote_dir/"
-                        ssh -i "$TOMCAT_SSH_KEY" -o BatchMode=yes -p "$TOMCAT_SSH_PORT" "$target" \
-                            "CATALINA_HOME=$CATALINA_HOME TOMCAT_HEALTH_URL=$TOMCAT_HEALTH_URL sh $remote_dir/deploy-tomcat.sh $remote_dir/image.war"
-                        ssh -i "$TOMCAT_SSH_KEY" -o BatchMode=yes -p "$TOMCAT_SSH_PORT" "$target" \
-                            "rm -rf -- $remote_dir"
-                    '''
-                }
+                    test -s "$war_file"
+                    if [ ! -d "$webapps_dir" ] || [ ! -w "$webapps_dir" ]; then
+                        echo "Tomcat webapps directory is missing or not writable: $webapps_dir" >&2
+                        exit 1
+                    fi
+                    if ! command -v curl >/dev/null 2>&1; then
+                        echo "curl is required for the Tomcat health check." >&2
+                        exit 1
+                    fi
+
+                    trap 'rm -f "$temporary_war"' EXIT
+                    trap 'exit 1' HUP INT TERM
+                    cp "$war_file" "$temporary_war"
+                    chmod 0644 "$temporary_war"
+
+                    # Replace only this application's exploded deployment and WAR.
+                    rm -rf -- "$webapps_dir/image"
+                    mv -f -- "$temporary_war" "$webapps_dir/image.war"
+
+                    attempt=1
+                    while [ "$attempt" -le 60 ]; do
+                        if curl --connect-timeout 5 --max-time 10 --fail --location \
+                                --silent --output /dev/null "$TOMCAT_HEALTH_URL"; then
+                            echo "Deployment verified at $TOMCAT_HEALTH_URL"
+                            exit 0
+                        fi
+                        sleep 5
+                        attempt=$((attempt + 1))
+                    done
+
+                    echo "Tomcat did not report a successful response from $TOMCAT_HEALTH_URL." >&2
+                    exit 1
+                '''
             }
         }
     }

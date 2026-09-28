@@ -1,120 +1,153 @@
-# Image
+# Java Tomcat Deployment
 
-A Java 17 web application packaged as `target/image.war` and deployed to Apache Tomcat. The existing `Main` console entry point is preserved; the WAR exposes the same greeting from a Jakarta Servlet at the application root.
+A Java 17 Jakarta Servlet application packaged as a WAR and deployed to Apache Tomcat. GitHub Actions builds, tests, and publishes the WAR. Jenkins downloads that exact artifact and deploys it to Tomcat on the **same host**. Jenkins does not build the application.
 
 ## Architecture
 
 ```text
-Developer --git push to main--> GitHub Actions
-                                  |
-                                  +-- Java 17 / Maven validate, test, package
-                                  +-- upload only image.war as
-                                  |   tomcat-deployment-war
-                                  +-- trigger Jenkins after upload succeeds
-                                            |
-                                            +-- download artifact from that
-                                            |   exact GitHub Actions run
-                                            +-- deploy image.war over SSH
-                                            +-- verify HTTP response
-                                                      |
-                                                      v
-                                                   Tomcat
+Developer
+   |
+   | push to main
+   v
+GitHub Actions
+   |-- Checkout source
+   |-- Build and test with Java 17 and Maven
+   |-- Package target/image.war
+   |-- Upload tomcat-deployment-war
+   `-- Trigger Jenkins only after upload succeeds
+             |
+             | run ID + artifact name
+             v
+Jenkins on the Tomcat host
+   |-- Download the artifact from that exact GitHub Actions run
+   |-- Deploy image.war to CATALINA_HOME/webapps
+   `-- Check the local application URL
+             |
+             v
+          Apache Tomcat
 ```
 
-Jenkins does not build or test the Java application. It retrieves the WAR uploaded by the triggering workflow run and deploys that binary.
+## Application
 
-## Application and local Maven commands
+| Property | Value |
+|---|---|
+| Java | 17 |
+| Maven coordinates | `org.image:Image:1.0-SNAPSHOT` |
+| Packaging | WAR |
+| WAR file | `target/image.war` |
+| Web technology | Jakarta Servlet 6 |
+| Test framework | JUnit 5 and Mockito |
+| Tomcat version | 10.1 or later |
+| Application context | `/image/` |
 
-- Java: 17.
-- Maven project coordinates: `org.image:Image:1.0-SNAPSHOT`.
-- Packaging: WAR; explicit Maven final name: `image.war`.
-- Web framework: traditional Jakarta Servlet 6 application, compatible with Tomcat 10.1 or later.
-- Test framework: JUnit 5 with Mockito.
-- Deployment context: `/image/` (from `image.war`).
+The original `org.image.Main` console class is preserved. The WAR exposes the greeting through a servlet at the application root.
 
-Run locally with Maven installed:
+## Build locally
+
+Install Java 17 and Maven, then run:
 
 ```sh
 mvn clean verify
 ```
 
-The command validates, compiles, runs tests, and packages `target/image.war`. To run the original console entry point, run `org.image.Main` from an IDE or execute the compiled class with Java after building.
+This validates and compiles the application, runs tests, and creates `target/image.war`.
 
-## GitHub Actions
+## GitHub Actions CI
 
-`.github/workflows/ci.yml` runs on pushes to `main` and supports `workflow_dispatch`. It uses Temurin Java 17, Maven dependency caching, and `mvn clean verify`. On success it confirms `target/image.war` exists, uploads only that file as the `tomcat-deployment-war` Actions artifact, and then triggers Jenkins. A failed validation, test, package, or artifact upload prevents the Jenkins trigger.
+The workflow is [`.github/workflows/ci.yml`](.github/workflows/ci.yml). It runs on pushes to `main` and can also be started manually with `workflow_dispatch`.
 
-Configure these repository **Actions secrets**:
+On a successful build and test, it verifies `target/image.war`, uploads only that file as the `tomcat-deployment-war` artifact, then triggers the Jenkins job `TomcatDeployment`. Jenkins is not triggered if any preceding CI or artifact-upload step fails.
+
+Add these **repository Actions secrets** under **GitHub → Settings → Secrets and variables → Actions**:
 
 | Secret | Value |
 |---|---|
-| `JENKINS_URL` | Jenkins base URL, including any context path, for example `https://jenkins.example.com/` |
-| `JENKINS_USER` | Dedicated Jenkins service account username |
 | `JENKINS_TOKEN` | API token for that account |
 
-The Jenkins account needs permission to read the crumb issuer and build `TomcatDeployment`. Keep Jenkins CSRF protection enabled. The workflow requests a crumb and sends it with the parameterized build request. Its GitHub token is not needed by the workflow; Jenkins uses its own GitHub credential to download the artifact.
+The workflow has the non-secret Jenkins URL `http://20.219.118.177:8080` and username `shsingh` configured directly in `ci.yml`. The Jenkins account needs permission to read the crumb issuer and start `TomcatDeployment`. CSRF protection must remain enabled; the workflow requests and sends a Jenkins crumb. Before deployment can be triggered, enable HTTPS for Jenkins and change the workflow's `JENKINS_URL` to its HTTPS address. The workflow intentionally refuses to send the API token over plain HTTP.
 
-## Jenkins deployment setup
+## Jenkins and Tomcat: same-host setup
 
-Install/configure Jenkins with:
+Jenkins and Tomcat must be installed on the **same server** for the current local-filesystem deployment. The Jenkins agent that executes this Pipeline must run on that server and have the label `tomcat-local`. No SSH connection or Tomcat SSH credential is used.
 
-- A Pipeline job named exactly `TomcatDeployment`, configured to load this repository's `Jenkinsfile` (for example, Pipeline script from SCM).
-- Pipeline, Credentials Binding, and GitHub API access via `curl`, `jq`, and `unzip` on the Jenkins agent.
-- `ssh` and `scp` on the Jenkins agent.
-- `curl` on the Tomcat host.
-- A GitHub credential with read-only access to Actions artifacts for this repository.
-- An SSH deploy account/key on the Tomcat host and that host's verified SSH host key in the Jenkins agent's `known_hosts`.
-- The Tomcat host's auto-deployment enabled for WAR files in its `webapps` directory.
+### 1. Prepare the server and Jenkins agent
 
-Run the job once after connecting its Jenkinsfile so Jenkins registers the three declared parameters; that bootstrap build will fail validation until it receives real GitHub parameters.
+- Install Tomcat 10.1 or later on the same server as Jenkins, and configure it to auto-deploy WAR files from its `webapps` directory.
+- Install Jenkins and register an agent on the Tomcat server with the label `tomcat-local`.
+- Run the Jenkins agent service as the dedicated operating-system account `shsingh` (or configure that account for the agent service).
+- Grant that account write permission only where required to deploy to Tomcat's `webapps` directory. Do not run Jenkins as root.
+- Ensure `curl`, `jq`, and `unzip` are available to the Jenkins agent.
 
-The pipeline job parameters are supplied by GitHub Actions:
+### 2. Create the Jenkins job
 
-| Parameter | Purpose |
+Create a **Pipeline** job named exactly `TomcatDeployment`:
+
+1. In Jenkins, select **New Item**, enter `TomcatDeployment`, choose **Pipeline**, then select **OK**.
+2. In the job configuration's **Pipeline** section, set **Definition** to **Pipeline script from SCM**.
+3. Set **SCM** to **Git** and enter the repository URL:
+   `https://github.com/shivamsingh163248/java-tomcat-deployment.git`
+4. Set the branch specifier to `*/main`. Credentials can be left empty for this public repository.
+5. Set **Script Path** to `Jenkinsfile`, then save.
+
+The Jenkinsfile restricts the job to an agent with label `tomcat-local` and skips the default source checkout. Run the job once after configuring it so Jenkins registers the declared parameters; a manual first build without GitHub-provided parameter values may fail validation.
+
+### 3. Add the GitHub artifact credential to Jenkins
+
+Jenkins must authenticate to GitHub to retrieve Actions artifacts, even though this repository is public. Public repository visibility does not make Actions artifacts anonymously downloadable.
+
+Create a fine-grained GitHub token scoped to this repository with **Actions: Read-only** permission. In Jenkins, open **Manage Jenkins → Credentials → System → Global credentials → Add Credentials** and create:
+
+| Setting | Value |
 |---|---|
-| `GITHUB_REPOSITORY` | `owner/repository` containing the workflow run |
-| `GITHUB_RUN_ID` | Run ID whose artifact must be deployed |
-| `ARTIFACT_NAME` | Must be `tomcat-deployment-war` |
+| Kind | Secret text |
+| ID | `github-actions-artifact-read-token` |
+| Secret | The fine-grained GitHub token |
 
-Create Jenkins credentials:
+The token is used only by Jenkins to download the artifact. Do not put it in the Jenkinsfile, workflow, or repository.
 
-| Credential ID | Jenkins kind | Purpose |
-|---|---|---|
-| `github-actions-artifact-read-token` | Secret text | Fine-grained GitHub token with Actions read access to this repository |
-| `tomcat-deploy-ssh` | SSH Username with private key | Restricted SSH access to the Tomcat host; the credential username is used by the pipeline |
+### 4. Configure Tomcat environment variables in Jenkins
 
-Configure the following environment variables in Jenkins (controller or agent environment used by the job):
+Set these variables in the environment of the `tomcat-local` Jenkins agent:
 
-| Variable | Example / requirement |
+| Variable | Example |
 |---|---|
-| `TOMCAT_HOST` | Tomcat server DNS name or IPv4 address; for the provided server, `20.219.118.177` |
-| `TOMCAT_SSH_PORT` | SSH port, commonly `22` |
-| `CATALINA_HOME` | Absolute Tomcat installation path on the remote host, such as `/srv/tomcat` |
-| `TOMCAT_REMOTE_TMP` | Absolute writable temporary directory on the remote host, such as `/tmp` |
-| `TOMCAT_HEALTH_URL` | `http://20.219.118.177:8080/image/` for the provided Tomcat server |
+| `CATALINA_HOME` | The actual absolute Tomcat installation path, for example `/srv/tomcat` |
+| `TOMCAT_HEALTH_URL` | `http://127.0.0.1:8081/image/` if Tomcat uses port `8081` |
 
-The provided URL `http://20.219.118.177:8080/` is the Tomcat server root. Since this project deploys as `image.war`, Tomcat serves the application under `/image/`; configure the health URL with that context path as shown above. Set these values in Jenkins' job/agent environment rather than hard-coding server addresses into GitHub Actions.
+Replace the example `CATALINA_HOME` with the path on your server. The supplied URL `http://20.219.118.177:8080/` responds as Jenkins, not Tomcat. Since Jenkins uses port `8080` on this host, configure Tomcat's HTTP connector to use a different available port, for example `8081`. With that example configuration, the application URL is `http://20.219.118.177:8081/image/`, and Jenkins checks it locally at `http://127.0.0.1:8081/image/`. Use the actual port configured for Tomcat and permit it through the server firewall if external access is required.
 
-Grant the SSH account write access to `${CATALINA_HOME}/webapps` and permission to create/remove its own temporary deployment directory. Do not grant broad filesystem access. The supplied `scripts/deploy-tomcat.sh` atomically stages `image.war`, replaces only the `/image` deployment, and waits up to five minutes for an HTTP success response. Tomcat must be configured to auto-deploy WARs; unrelated applications in `webapps` are not touched.
+### Jenkins job parameters
 
-Jenkins downloads artifact metadata for the supplied repository and run ID using the GitHub Actions Artifacts API, requires exactly one unexpired artifact with the requested name, and verifies the ZIP contains only `image.war`. It then transfers that file—not source for a Maven build—to Tomcat. Any download, validation, SSH, deployment, or health-check failure fails the Jenkins build.
+GitHub Actions supplies these parameters to `TomcatDeployment`:
 
-## Run and verify the pipeline
+| Parameter | Meaning |
+|---|---|
+| `GITHUB_REPOSITORY` | Repository that produced the artifact, in `owner/repository` format |
+| `GITHUB_RUN_ID` | Exact GitHub Actions run containing the artifact |
+| `ARTIFACT_NAME` | `tomcat-deployment-war` |
 
-1. Configure the GitHub secrets, Jenkins job/credentials, Jenkins environment variables, Tomcat auto-deployment, and SSH host key as described above.
-2. Push a commit to `main`, or start **Java CI and Tomcat deployment** with `workflow_dispatch`.
-3. Confirm the GitHub run's build, tests, WAR verification, and `tomcat-deployment-war` upload succeed before Jenkins starts.
-4. Confirm the corresponding `TomcatDeployment` build shows the same `GITHUB_RUN_ID` and reports deployment verification.
-5. Request `TOMCAT_HEALTH_URL`; a successful HTTP response confirms the application is available at `/image/`.
+## Deployment behavior
+
+Jenkins uses the repository and run ID to query the GitHub Actions Artifacts API. It requires exactly one unexpired artifact named `tomcat-deployment-war`, downloads it, and verifies that the archive contains only `image.war`.
+
+The Pipeline then stages the WAR locally, replaces only `${CATALINA_HOME}/webapps/image.war` and its exploded `${CATALINA_HOME}/webapps/image` directory, and waits up to five minutes for an HTTP success response from `TOMCAT_HEALTH_URL`. It does not remove or modify other Tomcat applications. A failed download, validation, filesystem deployment, or health check fails the Jenkins build.
+
+## Test the end-to-end pipeline
+
+1. Configure the GitHub secrets, Jenkins agent/job/credential, Tomcat environment variables, and directory permissions above.
+2. Push a commit to `main`, or manually run the **Java CI and Tomcat deployment** GitHub Actions workflow.
+3. Confirm CI and tests pass and the `tomcat-deployment-war` artifact is uploaded.
+4. Confirm Jenkins starts `TomcatDeployment` with the same `GITHUB_RUN_ID` and reports deployment verification.
+5. Open `http://20.219.118.177:8080/image/` to verify the deployed application.
 
 ## Troubleshooting and security
 
-- If the Jenkins trigger fails, verify the three GitHub secrets, Jenkins URL/context path, service-account build/crumb permissions, and that the job is named `TomcatDeployment`.
-- If Jenkins cannot find the artifact, ensure its GitHub credential has Actions read access to the same repository and that the run has not expired. Artifact retention is 30 days.
-- If SSH fails, check the credential username/key, host/port, `known_hosts`, and network access from the Jenkins agent.
-- If deployment verification times out, check `CATALINA_HOME`, `webapps` permissions, Tomcat logs, WAR auto-deployment settings, and `TOMCAT_HEALTH_URL`.
-- Never commit credentials, tokens, private keys, or deployment host details. Keep GitHub/Jenkins permissions least-privileged, protect the Tomcat SSH account, and do not disable Jenkins CSRF protection or SSH host-key verification.
+- **Jenkins is not triggered:** Check `JENKINS_URL`, `JENKINS_USER`, `JENKINS_TOKEN`, the job name, Jenkins permissions, and crumb endpoint access.
+- **Artifact download fails:** Check the `github-actions-artifact-read-token` credential's repository scope and Actions read permission, and verify the run's artifact has not expired. Artifacts are retained for 30 days.
+- **No matching agent:** Confirm the Jenkins agent runs on the Tomcat host and has the label `tomcat-local`.
+- **Deployment fails:** Confirm `CATALINA_HOME`, the agent account's `webapps` write permission, Tomcat auto-deployment, and Tomcat logs.
+- **Health check times out:** Confirm the application URL, Tomcat HTTP connector port, and local connectivity to `127.0.0.1`.
 
-The CI/CD infrastructure itself requires manual configuration: this repository cannot provision GitHub secrets, Jenkins credentials/job permissions, SSH trust, or a Tomcat server.
-#   j a v a - t o m c a t - d e p l o y m e n t  
- 
+Keep tokens and passwords out of source control. Use least-privilege GitHub/Jenkins credentials, do not run Jenkins as root, and keep Jenkins CSRF protection enabled. If a real token or password has been exposed in a chat or committed, revoke or rotate it.
+
+Jenkins, GitHub secrets/credentials, the same-host agent, and Tomcat must be configured manually; this repository cannot provision those services.
